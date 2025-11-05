@@ -148,7 +148,7 @@ data class Profile(
     val name: String = "",
     val apartment: String = "",
     val profilePhotoUri: String = "",
-    val myIdUri: String = ""          // persisted My ID image
+    val myIdUri: String = ""          // persisted My ID image (FileProvider URI after fix)
 )
 
 data class Visitor(
@@ -447,7 +447,18 @@ fun MyIDScreen() {
 
     LaunchedEffect(Unit) {
         profile = loadProfile(context)
-        myIdUri = profile.myIdUri.takeIf { it.isNotBlank() }?.let(Uri::parse)
+        // migrate old external URIs to private copy once
+        val current = profile.myIdUri
+        val initial = current.takeIf { it.isNotBlank() }?.let(Uri::parse)
+        val migrated: String = if (initial != null && !isOurFileProviderUri(context, initial) && isUriReadable(context, initial)) {
+            copyToPrivateFile(context, initial, subdir = "id_images")?.toString() ?: ""
+        } else current
+        if (migrated != current) {
+            val updated = profile.copy(myIdUri = migrated)
+            profile = updated
+            scope.launch { saveProfile(context, updated) }
+        }
+        myIdUri = migrated.takeIf { it.isNotBlank() }?.let(Uri::parse)
     }
 
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -455,12 +466,17 @@ fun MyIDScreen() {
             runCatching {
                 context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            myIdUri = uri
-            val updated = profile.copy(myIdUri = uri.toString())
+            // Save our PRIVATE copy and store our FileProvider URI
+            val privateUri = copyToPrivateFile(context, uri, subdir = "id_images")
+            myIdUri = privateUri
+            val updated = profile.copy(myIdUri = privateUri?.toString() ?: "")
             profile = updated
             scope.launch { saveProfile(context, updated) }
+            Toast.makeText(context, "ID image saved privately.", Toast.LENGTH_SHORT).show()
         }
     }
+
+    val idAvailable = isUriReadable(context, myIdUri)
 
     Column(Modifier.fillMaxSize()) {
 
@@ -470,7 +486,7 @@ fun MyIDScreen() {
             Modifier.fillMaxSize().padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            if (myIdUri != null) {
+            if (idAvailable && myIdUri != null) {
                 Image(
                     painter = rememberAsyncImagePainter(myIdUri),
                     contentDescription = "My ID",
@@ -485,20 +501,26 @@ fun MyIDScreen() {
             Spacer(Modifier.height(16.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { pickImage.launch(arrayOf("image/*")) }) {
-                    Text(if (myIdUri == null) "Pick My ID" else "Replace My ID")
+                    Text(if (!idAvailable) "Pick My ID" else "Replace My ID")
                 }
-                if (myIdUri != null) {
-                    Button(onClick = {
-                        val shareUri = copyToCacheForEmail(context, myIdUri!!)
-                        val intent = Intent(Intent.ACTION_SEND).apply {
-                            type = context.contentResolver.getType(shareUri) ?: "image/*"
-                            putExtra(Intent.EXTRA_STREAM, shareUri)
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            clipData = ClipData.newRawUri("id", shareUri)
+                Button(
+                    onClick = {
+                        if (idAvailable && myIdUri != null) {
+                            // Share our own FileProvider URI directly
+                            val shareUri = myIdUri!!
+                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                type = context.contentResolver.getType(shareUri) ?: "image/*"
+                                putExtra(Intent.EXTRA_STREAM, shareUri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                clipData = ClipData.newRawUri("id", shareUri)
+                            }
+                            context.startActivity(Intent.createChooser(intent, "Share My ID"))
+                        } else {
+                            Toast.makeText(context, "ID image not found. Please replace it.", Toast.LENGTH_SHORT).show()
                         }
-                        context.startActivity(Intent.createChooser(intent, "Share My ID"))
-                    }) { Text("Share") }
-                }
+                    },
+                    enabled = idAvailable
+                ) { Text("Share") }
             }
         }
     }
@@ -813,19 +835,47 @@ fun VisitorsScreen() {
     var departure by remember { mutableStateOf<LocalTime?>(null) }
     var saveForReuse by remember { mutableStateOf(true) }
 
+    // Pick → copy to private storage immediately
     val pickVisitorId = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             runCatching {
                 context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            pickedUri = uri
+            pickedUri = ensurePrivateImage(context, uri, subdir = "visitor_images")
+            if (pickedUri == null) {
+                Toast.makeText(context, "Couldn't save the ID image", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
     LaunchedEffect(Unit) {
-        visitors = loadVisitors(context).sortedWith(compareBy<Visitor> { it.date }.thenBy { it.arrival })
-        savedPeople = loadSavedPeople(context)
         profile = loadProfile(context)
+
+        // Load then migrate any non-private URIs to private copies
+        val loadedVisitors = loadVisitors(context)
+        val migratedVisitors = loadedVisitors.map { v ->
+            val src = Uri.parse(v.idImageUri)
+            val fixed = if (isOurFileProviderUri(context, src)) src
+            else if (isUriReadable(context, src)) ensurePrivateImage(context, src, "visitor_images")
+            else src
+            if (fixed != null && fixed.toString() != v.idImageUri) v.copy(idImageUri = fixed.toString()) else v
+        }
+
+        val loadedSaved = loadSavedPeople(context)
+        val migratedSaved = loadedSaved.map { p ->
+            val src = Uri.parse(p.idImageUri)
+            val fixed = if (isOurFileProviderUri(context, src)) src
+            else if (isUriReadable(context, src)) ensurePrivateImage(context, src, "visitor_images")
+            else src
+            if (fixed != null && fixed.toString() != p.idImageUri) p.copy(idImageUri = fixed.toString()) else p
+        }
+
+        // Persist migrations if anything changed
+        if (migratedVisitors != loadedVisitors) saveVisitors(context, migratedVisitors)
+        if (migratedSaved != loadedSaved) saveSavedPeople(context, migratedSaved)
+
+        visitors = migratedVisitors.sortedWith(compareBy<Visitor> { it.date }.thenBy { it.arrival })
+        savedPeople = migratedSaved
     }
 
     val fmt24 = remember { DateTimeFormatter.ofPattern("HH:mm") }   // stored
@@ -1011,7 +1061,10 @@ fun VisitorsScreen() {
                                 uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                             )
                         }
-                        newIdUri = uri
+                        newIdUri = ensurePrivateImage(context, uri, "visitor_images")
+                        if (newIdUri == null) {
+                            Toast.makeText(context, "Couldn't save the ID image", Toast.LENGTH_SHORT).show()
+                        }
                     }
                 }
 
@@ -1169,7 +1222,6 @@ fun VisitorsScreen() {
         }
     }
 
-    // Add Visitor dialog
     // Add Visit dialog
     if (showAdd) {
         AlertDialog(
@@ -1251,18 +1303,21 @@ fun VisitorsScreen() {
             confirmButton = {
                 Button(onClick = {
                     val n = visitorName.trim()
-                    val u = pickedUri
+                    val src = pickedUri
                     val a = arrival
                     val d = departure
-                    if (n.isBlank() || u == null || a == null || d == null) return@Button
+                    if (n.isBlank() || src == null || a == null || d == null) return@Button
 
-                    runCatching {
-                        context.contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    // Guarantee a private copy
+                    val priv = ensurePrivateImage(context, src, "visitor_images")
+                    if (priv == null) {
+                        Toast.makeText(context, "Couldn't save the ID image", Toast.LENGTH_SHORT).show()
+                        return@Button
                     }
 
                     val v = Visitor(
                         name = n,
-                        idImageUri = u.toString(),
+                        idImageUri = priv.toString(),
                         arrival = a.format(fmt24),
                         departure = d.format(fmt24),
                         date = LocalDate.now().toString()
@@ -1273,9 +1328,9 @@ fun VisitorsScreen() {
                     scope.launch { saveVisitors(context, newList) }
 
                     if (saveForReuse) {
-                        val exists = savedPeople.any { it.name.equals(n, true) && it.idImageUri == u.toString() }
+                        val exists = savedPeople.any { it.name.equals(n, true) && it.idImageUri == priv.toString() }
                         if (!exists) {
-                            val sp = savedPeople + SavedPerson(name = n, idImageUri = u.toString())
+                            val sp = savedPeople + SavedPerson(name = n, idImageUri = priv.toString())
                             savedPeople = sp
                             scope.launch { saveSavedPeople(context, sp) }
                         }
@@ -1352,14 +1407,33 @@ private fun VisitorRow(
     var menuOpen by remember { mutableStateOf(false) }
 
     Card(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
-        Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Column(Modifier.weight(1f)) {
                 Text(v.name, style = MaterialTheme.typography.titleMedium)
                 Text("$fmtDate   ${times.first} → ${times.second}", style = MaterialTheme.typography.bodyMedium)
             }
-            Row {
+            // Email + More side-by-side (not stacked)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                val src = Uri.parse(v.idImageUri)
+                val readable = isUriReadable(context, src)
+
                 IconButton(onClick = {
-                    val attachment = copyToCacheForEmail(context, Uri.parse(v.idImageUri))
+                    if (!readable) {
+                        Toast.makeText(
+                            context,
+                            "Visitor ID image not found. Please update it.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        return@IconButton
+                    }
+                    val attachment = copyToCacheForEmail(context, src) ?: run {
+                        Toast.makeText(context, "Couldn’t attach the ID image.", Toast.LENGTH_LONG).show()
+                        return@IconButton
+                    }
                     val subject = "Visitor"
                     val body = """
                         Dear all,
@@ -1379,20 +1453,35 @@ private fun VisitorRow(
                         clipData = ClipData.newRawUri("attachment", attachment)
                     }
                     context.startActivity(Intent.createChooser(intent, "Send email"))
-                }) { Icon(Icons.Filled.Email, contentDescription = "Email", tint = FalTeal) }
+                }, enabled = readable) {
+                    Icon(Icons.Filled.Email, contentDescription = "Email", tint = if (readable) FalTeal else Color.Gray)
+                }
 
+                // Box only for the dropdown anchor; button sits in the same row
                 Box {
-                    IconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "More") }
+                    IconButton(onClick = { menuOpen = true }) {
+                        Icon(Icons.Filled.MoreVert, contentDescription = "More")
+                    }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                        DropdownMenuItem(text = { Text("Edit") }, onClick = { menuOpen = false; onEdit(v) })
-                        DropdownMenuItem(text = { Text("Duplicate for tomorrow") }, onClick = { menuOpen = false; onDuplicateTomorrow(v) })
-                        DropdownMenuItem(text = { Text("Delete") }, onClick = { menuOpen = false; onDelete(v) })
+                        DropdownMenuItem(text = { Text("Edit") }, onClick = {
+                            menuOpen = false
+                            onEdit(v)
+                        })
+                        DropdownMenuItem(text = { Text("Duplicate for tomorrow") }, onClick = {
+                            menuOpen = false
+                            onDuplicateTomorrow(v)
+                        })
+                        DropdownMenuItem(text = { Text("Delete") }, onClick = {
+                            menuOpen = false
+                            onDelete(v)
+                        })
                     }
                 }
             }
         }
     }
 }
+
 
 @Composable
 private fun EditVisitDialog(
@@ -1465,7 +1554,8 @@ private fun ManageSavedPeopleDialog(
         if (uri != null && editing != null) {
             runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             val e = editing!!
-            list = list.map { if (it.id == e.id) it.copy(idImageUri = uri.toString()) else it }
+            val priv = ensurePrivateImage(context, uri, "visitor_images") ?: return@rememberLauncherForActivityResult
+            list = list.map { if (it.id == e.id) it.copy(idImageUri = priv.toString()) else it }
         }
     }
 
@@ -1744,14 +1834,18 @@ private suspend fun saveSavedPeople(context: Context, people: List<SavedPerson>)
 
 /* ========================= Email / phone helpers ==================== */
 
-private fun copyToCacheForEmail(context: Context, source: Uri): Uri {
-    val dir = File(context.cacheDir, "attachments").apply { mkdirs() }
-    val fileName = resolveDisplayName(context.contentResolver, source) ?: "visitor_id.jpg"
-    val outFile = File(dir, fileName)
-    context.contentResolver.openInputStream(source)?.use { input ->
-        FileOutputStream(outFile).use { output -> input.copyTo(output) }
+private fun copyToCacheForEmail(context: Context, source: Uri): Uri? {
+    return try {
+        val dir = File(context.cacheDir, "attachments").apply { mkdirs() }
+        val fileName = resolveDisplayName(context.contentResolver, source) ?: "visitor_id.jpg"
+        val outFile = File(dir, fileName)
+        context.contentResolver.openInputStream(source)?.use { input ->
+            FileOutputStream(outFile).use { output -> input.copyTo(output) }
+        }
+        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", outFile)
+    } catch (_: Exception) {
+        null
     }
-    return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", outFile)
 }
 
 private fun resolveDisplayName(resolver: ContentResolver, uri: Uri): String? {
@@ -1760,6 +1854,11 @@ private fun resolveDisplayName(resolver: ContentResolver, uri: Uri): String? {
         if (idx != -1 && c.moveToFirst()) return c.getString(idx)
     }
     return null
+}
+
+private fun isOurFileProviderUri(context: Context, uri: Uri?): Boolean {
+    if (uri == null) return false
+    return uri.authority == "${context.packageName}.fileprovider"
 }
 
 private fun dial(context: Context, number: String) {
@@ -1853,4 +1952,40 @@ class ReminderReceiver : BroadcastReceiver() {
 
         NotificationManagerCompat.from(context).notify((name + time).hashCode(), notif)
     }
+}
+
+/* ======================= Image/URI safety helpers =================== */
+
+private fun isUriReadable(context: Context, uri: Uri?): Boolean {
+    if (uri == null) return false
+    return try {
+        context.contentResolver.openInputStream(uri).use { it != null }
+    } catch (_: Exception) { false }
+}
+
+/** Copy a content Uri to app-private filesDir/<subdir>/ and return a FileProvider Uri. */
+private fun copyToPrivateFile(
+    context: Context,
+    src: Uri,
+    subdir: String,
+    suggestedName: String = "image_${System.currentTimeMillis()}.jpg"
+): Uri? {
+    return try {
+        val resolver = context.contentResolver
+        val inS = resolver.openInputStream(src) ?: return null
+        val dir = java.io.File(context.filesDir, subdir).apply { mkdirs() }
+        val name = resolveDisplayName(resolver, src) ?: suggestedName
+        val outFile = java.io.File(dir, name)
+        inS.use { input ->
+            java.io.FileOutputStream(outFile).use { out -> input.copyTo(out) }
+        }
+        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", outFile)
+    } catch (_: Exception) { null }
+}
+
+/** If already a FileProvider Uri -> return it, else copy to private and return that. */
+private fun ensurePrivateImage(context: Context, uri: Uri?, subdir: String): Uri? {
+    if (uri == null) return null
+    return if (isOurFileProviderUri(context, uri)) uri
+    else copyToPrivateFile(context, uri, subdir)
 }

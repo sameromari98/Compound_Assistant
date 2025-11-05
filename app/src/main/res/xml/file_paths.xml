@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- We copy visitor ID images here before emailing -->
-    <cache-path name="attachments" path="attachments/"/>
+    <cache-path name="attachments" path="attachments/" />
+    <files-path name="id_images" path="id_images/" />
+    <files-path name="visitor_images" path="visitor_images/" />
 </paths>
+
